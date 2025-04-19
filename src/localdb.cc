@@ -376,18 +376,30 @@ const std::string& Table::getName() const {
     return name_;
 }
 
-bool Table::beginRead() {
-    mutex_.lock_shared();
-    return true;
+bool Table::beginRead(std::chrono::milliseconds timeout) {
+    auto end_time = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < end_time) {
+        if (mutex_.try_lock_shared()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return false;
 }
 
 void Table::endRead() {
     mutex_.unlock_shared();
 }
 
-bool Table::beginWrite() {
-    mutex_.lock();
-    return true;
+bool Table::beginWrite(std::chrono::milliseconds timeout) {
+    auto end_time = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < end_time) {
+        if (mutex_.try_lock()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return false;
 }
 
 void Table::endWrite() {
@@ -609,21 +621,78 @@ bool Transaction::insert(const std::string& table_name, const Row& row) {
         return false;
     }
     
-    if (table->beginWrite()) {
-        bool result = table->insert(row);
-        if (result) {
-            // Add rollback operation
-            rollback_operations_[table_name].push_back([table, row]() {
-                table->remove([&row](const Row& r) {
-                    return r == row;
-                });
-            });
-        }
-        table->endWrite();
-        return result;
+    // Check if row size matches columns size
+    if (row.size() != table->getColumns().size()) {
+        return false;
     }
     
-    return false;
+    // 使用直接锁定技术和超时控制
+    auto start_time = std::chrono::steady_clock::now();
+    auto timeout = std::chrono::milliseconds(500); // 最多等待500毫秒
+    
+    bool write_success = false;
+    bool result = false;
+    
+    while (std::chrono::steady_clock::now() - start_time < timeout) {
+        try {
+            std::unique_lock<std::shared_mutex> lock(table->mutex_, std::try_to_lock);
+            if (lock.owns_lock()) {
+                // 检查主键约束
+                int pk_index = table->findPrimaryKeyIndex();
+                bool constraint_violated = false;
+                
+                if (pk_index >= 0) {
+                    for (const auto& existing_row : table->rows_) {
+                        if (existing_row[pk_index] == row[pk_index]) {
+                            constraint_violated = true; // 主键约束冲突
+                            break;
+                        }
+                    }
+                }
+                
+                // 检查唯一约束
+                if (!constraint_violated) {
+                    const auto& columns = table->getColumns();
+                    for (size_t i = 0; i < columns.size(); i++) {
+                        if (columns[i].unique) {
+                            for (const auto& existing_row : table->rows_) {
+                                if (existing_row[i] == row[i]) {
+                                    constraint_violated = true; // 唯一约束冲突
+                                    break;
+                                }
+                            }
+                            if (constraint_violated) break;
+                        }
+                    }
+                }
+                
+                // 如果没有约束冲突，则插入行
+                if (!constraint_violated) {
+                    table->rows_.push_back(row);
+                    
+                    // 添加回滚操作
+                    rollback_operations_[table_name].push_back([table, row]() {
+                        std::unique_lock<std::shared_mutex> lock(table->mutex_);
+                        table->rows_.erase(
+                            std::remove_if(table->rows_.begin(), table->rows_.end(), 
+                                [&row](const Row& r) { return r == row; }),
+                            table->rows_.end()
+                        );
+                    });
+                    
+                    result = true;
+                }
+                
+                write_success = true;
+                break;
+            }
+        } catch (...) {
+            // 忽略异常，继续尝试
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    
+    return write_success && result;
 }
 
 bool Transaction::update(const std::string& table_name, const Row& row, 
@@ -637,34 +706,94 @@ bool Transaction::update(const std::string& table_name, const Row& row,
         return false;
     }
     
-    if (table->beginWrite()) {
-        // Get the rows that will be updated first for rollback
-        std::vector<Row> original_rows = table->select(predicate);
-        
-        bool result = table->update(row, predicate);
-        
-        if (result && !original_rows.empty()) {
-            // Add rollback operation for each updated row
-            for (const auto& original_row : original_rows) {
-                rollback_operations_[table_name].push_back([table, original_row]() {
-                    table->update(original_row, [&original_row, table](const Row& r) {
-                        // Use primary key to identify the row if available
-                        int pk_index = table->findPrimaryKeyIndex();
-                        if (pk_index >= 0) {
-                            return r[pk_index] == original_row[pk_index];
-                        }
-                        // Otherwise use the whole row
-                        return r == original_row;
-                    });
-                });
-            }
-        }
-        
-        table->endWrite();
-        return result;
+    // Check if row size matches columns size
+    if (row.size() != table->getColumns().size()) {
+        return false;
     }
     
-    return false;
+    // 使用直接锁定技术和超时控制
+    auto start_time = std::chrono::steady_clock::now();
+    auto timeout = std::chrono::milliseconds(500); // 最多等待500毫秒
+    
+    // 首先读取需要更新的行用于回滚
+    std::vector<Row> original_rows;
+    {
+        bool read_success = false;
+        while (std::chrono::steady_clock::now() - start_time < timeout) {
+            try {
+                std::shared_lock<std::shared_mutex> lock(table->mutex_, std::try_to_lock);
+                if (lock.owns_lock()) {
+                    for (const auto& existing_row : table->rows_) {
+                        if (predicate(existing_row)) {
+                            original_rows.push_back(existing_row);
+                        }
+                    }
+                    read_success = true;
+                    break;
+                }
+            } catch (...) {
+                // 忽略异常，继续尝试
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        
+        if (!read_success) {
+            return false; // 超时无法读取
+        }
+    }
+    
+    // 然后获取写锁并执行更新
+    {
+        bool write_success = false;
+        bool result = false;
+        
+        while (std::chrono::steady_clock::now() - start_time < timeout) {
+            try {
+                std::unique_lock<std::shared_mutex> lock(table->mutex_, std::try_to_lock);
+                if (lock.owns_lock()) {
+                    result = false; // 重置结果
+                    
+                    // 执行更新
+                    for (auto& existing_row : table->rows_) {
+                        if (predicate(existing_row)) {
+                            existing_row = row;
+                            result = true;
+                        }
+                    }
+                    
+                    // 如果更新成功，添加回滚操作
+                    if (result && !original_rows.empty()) {
+                        for (const auto& original_row : original_rows) {
+                            rollback_operations_[table_name].push_back([table, original_row]() {
+                                std::unique_lock<std::shared_mutex> lock(table->mutex_);
+                                for (auto& r : table->rows_) {
+                                    // 使用主键识别行（如果有）
+                                    int pk_index = table->findPrimaryKeyIndex();
+                                    if (pk_index >= 0) {
+                                        if (r[pk_index] == original_row[pk_index]) {
+                                            r = original_row;
+                                            break;
+                                        }
+                                    } else if (r == original_row) { // 否则使用整行比较
+                                        r = original_row;
+                                        break;
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    
+                    write_success = true;
+                    break;
+                }
+            } catch (...) {
+                // 忽略异常，继续尝试
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        
+        return write_success && result;
+    }
 }
 
 bool Transaction::remove(const std::string& table_name, 
@@ -678,26 +807,78 @@ bool Transaction::remove(const std::string& table_name,
         return false;
     }
     
-    if (table->beginWrite()) {
-        // Get the rows that will be deleted first for rollback
-        std::vector<Row> deleted_rows = table->select(predicate);
-        
-        bool result = table->remove(predicate);
-        
-        if (result && !deleted_rows.empty()) {
-            // Add rollback operation to reinsert all deleted rows
-            rollback_operations_[table_name].push_back([table, deleted_rows]() {
-                for (const auto& row : deleted_rows) {
-                    table->insert(row);
+    // 使用直接锁定技术和超时控制
+    auto start_time = std::chrono::steady_clock::now();
+    auto timeout = std::chrono::milliseconds(500); // 最多等待500毫秒
+    
+    // 首先读取需要删除的行用于回滚
+    std::vector<Row> deleted_rows;
+    {
+        bool read_success = false;
+        while (std::chrono::steady_clock::now() - start_time < timeout) {
+            try {
+                std::shared_lock<std::shared_mutex> lock(table->mutex_, std::try_to_lock);
+                if (lock.owns_lock()) {
+                    for (const auto& existing_row : table->rows_) {
+                        if (predicate(existing_row)) {
+                            deleted_rows.push_back(existing_row);
+                        }
+                    }
+                    read_success = true;
+                    break;
                 }
-            });
+            } catch (...) {
+                // 忽略异常，继续尝试
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         
-        table->endWrite();
-        return result;
+        if (!read_success) {
+            return false; // 超时无法读取
+        }
     }
     
-    return false;
+    // 然后获取写锁并执行删除
+    {
+        bool write_success = false;
+        bool result = false;
+        
+        while (std::chrono::steady_clock::now() - start_time < timeout) {
+            try {
+                std::unique_lock<std::shared_mutex> lock(table->mutex_, std::try_to_lock);
+                if (lock.owns_lock()) {
+                    // 记录原始大小
+                    size_t original_size = table->rows_.size();
+                    
+                    // 执行删除
+                    table->rows_.erase(
+                        std::remove_if(table->rows_.begin(), table->rows_.end(), predicate),
+                        table->rows_.end()
+                    );
+                    
+                    result = table->rows_.size() < original_size;
+                    
+                    // 如果删除成功，添加回滚操作
+                    if (result && !deleted_rows.empty()) {
+                        rollback_operations_[table_name].push_back([table, deleted_rows]() {
+                            std::unique_lock<std::shared_mutex> lock(table->mutex_);
+                            for (const auto& row : deleted_rows) {
+                                table->rows_.push_back(row);
+                            }
+                        });
+                    }
+                    
+                    write_success = true;
+                    break;
+                }
+            } catch (...) {
+                // 忽略异常，继续尝试
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        
+        return write_success && result;
+    }
 }
 
 std::vector<Row> Transaction::select(const std::string& table_name,
@@ -711,12 +892,31 @@ std::vector<Row> Transaction::select(const std::string& table_name,
         return {};
     }
     
-    if (table->beginRead()) {
-        auto result = table->select(predicate);
-        table->endRead();
-        return result;
+    // 限制尝试时间，避免无限等待
+    auto start_time = std::chrono::steady_clock::now();
+    auto timeout = std::chrono::milliseconds(500); // 最多等待500毫秒
+
+    while (std::chrono::steady_clock::now() - start_time < timeout) {
+        try {
+            // 使用RAII锁模式而不是手动加锁解锁
+            std::shared_lock<std::shared_mutex> lock(table->mutex_, std::try_to_lock);
+            if (lock.owns_lock()) {
+                std::vector<Row> result;
+                for (const auto& row : table->rows_) {
+                    if (predicate(row)) {
+                        result.push_back(row);
+                    }
+                }
+                return result;
+            }
+        } catch (...) {
+            // 忽略任何异常并继续尝试
+        }
+        // 短暂休眠后重试
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     
+    // 如果超时，返回空结果
     return {};
 }
 

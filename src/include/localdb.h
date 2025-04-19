@@ -12,6 +12,8 @@
 #include <condition_variable>
 #include <shared_mutex>
 #include <fstream>
+#include <chrono>
+#include <thread>
 
 // Fallback for shared_mutex if not available in the standard library
 #if __cplusplus < 201703L
@@ -19,11 +21,73 @@ namespace std {
     class shared_mutex {
     private:
         std::mutex mutex_;
+        std::atomic<int> shared_count_ = {0};
+        std::condition_variable cv_;
+        bool exclusive_ = false;
     public:
-        void lock() { mutex_.lock(); }
-        void unlock() { mutex_.unlock(); }
-        void lock_shared() { mutex_.lock(); }
-        void unlock_shared() { mutex_.unlock(); }
+        void lock() {
+            std::unique_lock<std::mutex> lk(mutex_);
+            cv_.wait(lk, [this] { return shared_count_ == 0 && !exclusive_; });
+            exclusive_ = true;
+        }
+        
+        void unlock() {
+            std::unique_lock<std::mutex> lk(mutex_);
+            exclusive_ = false;
+            cv_.notify_all();
+        }
+        
+        void lock_shared() {
+            std::unique_lock<std::mutex> lk(mutex_);
+            cv_.wait(lk, [this] { return !exclusive_; });
+            ++shared_count_;
+        }
+        
+        void unlock_shared() {
+            std::unique_lock<std::mutex> lk(mutex_);
+            --shared_count_;
+            if (shared_count_ == 0) {
+                cv_.notify_all();
+            }
+        }
+        
+        bool try_lock() {
+            std::unique_lock<std::mutex> lk(mutex_, std::try_to_lock);
+            if (!lk.owns_lock() || shared_count_ > 0 || exclusive_) {
+                return false;
+            }
+            exclusive_ = true;
+            return true;
+        }
+        
+        bool try_lock_shared() {
+            std::unique_lock<std::mutex> lk(mutex_, std::try_to_lock);
+            if (!lk.owns_lock() || exclusive_) {
+                return false;
+            }
+            ++shared_count_;
+            return true;
+        }
+        
+        template<class Rep, class Period>
+        bool try_lock_for(const std::chrono::duration<Rep, Period>& duration) {
+            std::unique_lock<std::mutex> lk(mutex_);
+            if (!cv_.wait_for(lk, duration, [this] { return shared_count_ == 0 && !exclusive_; })) {
+                return false;
+            }
+            exclusive_ = true;
+            return true;
+        }
+        
+        template<class Rep, class Period>
+        bool try_lock_shared_for(const std::chrono::duration<Rep, Period>& duration) {
+            std::unique_lock<std::mutex> lk(mutex_);
+            if (!cv_.wait_for(lk, duration, [this] { return !exclusive_; })) {
+                return false;
+            }
+            ++shared_count_;
+            return true;
+        }
     };
     
     template<class Mutex>
@@ -146,22 +210,22 @@ public:
     const std::string& getName() const;
 
     // Thread-safe operations
-    bool beginRead();
+    bool beginRead(std::chrono::milliseconds timeout = std::chrono::milliseconds(5000));
     void endRead();
-    bool beginWrite();
+    bool beginWrite(std::chrono::milliseconds timeout = std::chrono::milliseconds(5000));
     void endWrite();
 
     // Serialization/Deserialization
     void serialize(std::ostream& out) const;
     static std::unique_ptr<Table> deserialize(std::istream& in);
 
+    // Thread synchronization (public for low-level access by Transaction)
+    std::shared_mutex mutex_;
+
 private:
     std::string name_;
     std::vector<Column> columns_;
     std::vector<Row> rows_;
-    
-    // Thread synchronization
-    std::shared_mutex mutex_;
     
     // Find primary key column index
     int findPrimaryKeyIndex() const;
@@ -220,6 +284,18 @@ private:
     bool active_;
     std::map<std::string, std::vector<std::function<void()>>> rollback_operations_;
 };
+
+// Example retry logic for transaction operations
+inline bool performTransactionOperation(std::function<bool()> operation, int maxRetries = 3) {
+    for (int attempt = 0; attempt < maxRetries; attempt++) {
+        if (operation()) {
+            return true;
+        }
+        // Exponential backoff
+        std::this_thread::sleep_for(std::chrono::milliseconds(10 * (1 << attempt)));
+    }
+    return false;
+}
 
 } // namespace localdb
 

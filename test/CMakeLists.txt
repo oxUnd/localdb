@@ -5,6 +5,7 @@ add_executable(
   table_test.cc
   database_test.cc
   transaction_test.cc
+  test_main.cc
 )
 
 # Include the main source directory to access implementation files
@@ -15,7 +16,6 @@ target_link_libraries(
   localdb_test
   PRIVATE
   gtest
-  gtest_main
   Threads::Threads
 )
 

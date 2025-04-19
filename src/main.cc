@@ -229,6 +229,14 @@ void demo_disk_operations() {
 int main() {
     std::cout << "LocalDB Demo - Multi-threaded Relational Database" << std::endl;
     
+    // 设置全局超时，防止程序运行超过10秒
+    std::thread timeout_thread([]() {
+        std::this_thread::sleep_for(std::chrono::seconds(10));
+        std::cerr << "\n程序运行超时（10秒），强制退出。可能存在死锁问题。" << std::endl;
+        std::exit(1);
+    });
+    timeout_thread.detach();
+    
     // Part 1: Demonstrate basic multi-threading capabilities
     {
         // Create a database
